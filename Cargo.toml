@@ -1,9 +1,17 @@
 [package]
-name = "MemPool"
+name = "mem_pool"
 version = "0.1.0"
 edition = "2021"
 authors = ["Nuno Neto"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
+[dev-dependencies]
+criterion = "0.4.0"
+criterion-plot = "0.5.0"
+rayon = "1.7.0"
+oneshot = "0.1.5"
+
+[[bench]]
+name = "mempool_bench"
+harness = false
