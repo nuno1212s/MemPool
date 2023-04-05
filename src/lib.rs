@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use crossbeam_channel::{Receiver, Sender};
 
 pub struct MemPool<T> {
     inner: Arc<InnerPool<T>>,
@@ -9,71 +9,72 @@ pub struct MemPool<T> {
 }
 
 pub struct InnerPool<T> {
-    buckets: Vec<Mutex<Vec<T>>>,
+    buckets_txs: Vec<Sender<T>>,
+    buckets_rxs: Vec<Receiver<T>>,
+    buckets: usize,
     capacity: usize,
 }
 
 impl<T> InnerPool<T> {
     pub fn new<F>(bucket_count: usize, capacity_per_bucket: usize,
                   init_fn: F) -> Arc<Self> where F: Fn() -> T {
-        let mut buckets = Vec::with_capacity(bucket_count);
+        let mut buckets_rxs = Vec::with_capacity(bucket_count);
+        let mut buckets_txs = Vec::with_capacity(bucket_count);
 
         for _ in 0..bucket_count {
-            let mut vec = Vec::with_capacity(capacity_per_bucket);
+            let (tx, rx) = crossbeam_channel::bounded(capacity_per_bucket);
 
             for _ in 0..capacity_per_bucket {
-                vec.push(init_fn());
+                tx.try_send(init_fn()).unwrap();
             }
 
-            buckets.push(Mutex::new(vec));
+            buckets_rxs.push(rx);
+            buckets_txs.push(tx);
         }
 
         Arc::new(
             Self {
-                buckets,
+                buckets_rxs,
+                buckets_txs,
                 capacity: capacity_per_bucket,
+                buckets: bucket_count,
             }
         )
     }
 
     fn try_pull_from_bucket<'a>(self: &'a Arc<Self>, counter: usize) -> Option<MutMemShare<'a, T>> {
-        let bucket = counter % self.buckets.len();
+        let bucket = counter % self.buckets;
 
-        let mem = {
-            let mut bucket_guard = self.buckets[bucket].lock().unwrap();
-
-            bucket_guard.pop()
-        };
-
-        mem.map(|mem| MutMemShare {
-            pool: self,
-            mem: Some(mem),
-            bucket,
-        })
+        match self.buckets_rxs[bucket].try_recv() {
+            Ok(mem) => {
+                Some(MutMemShare {
+                    pool: self,
+                    mem: Some(mem),
+                    bucket,
+                })
+            }
+            Err(_) => {
+                None
+            }
+        }
     }
 
     fn try_pull_from_bucket_with_fallback<'a, F>(self: &'a Arc<Self>, counter: usize, fallback: F) -> MutMemShare<'a, T>
         where F: Fn() -> T {
-        let bucket = counter % self.buckets.len();
+        let bucket = counter % self.buckets;
 
-        let mem = {
-            let mut bucket_guard = self.buckets[bucket].lock().unwrap();
-
-            bucket_guard.pop()
-        };
-
-        match mem {
-            None => {
-                MutMemShare {
-                    pool: self,
-                    mem: Some(fallback()),
-                    bucket,
-                }
-            }
-            Some(mem) => {
+        match self.buckets_rxs[bucket].try_recv() {
+            Ok(mem) => {
                 MutMemShare {
                     pool: self,
                     mem: Some(mem),
+                    bucket,
+                }
+            }
+            Err(_) => {
+                MutMemShare {
+                    pool: self,
+                    mem: Some(fallback()),
                     bucket,
                 }
             }
@@ -81,13 +82,9 @@ impl<T> InnerPool<T> {
     }
 
     fn re_attach(&self, bucket: usize, mem: T) {
-        let final_bucket = bucket % self.buckets.len();
+        let final_bucket = bucket % self.buckets;
 
-        let mut bucket_guard = self.buckets[final_bucket].lock().unwrap();
-
-        if bucket_guard.len() < self.capacity {
-            bucket_guard.push(mem);
-        }
+        let _ = self.buckets_txs[final_bucket].try_send(mem);
     }
 }
 
@@ -208,7 +205,7 @@ mod tests {
 
     #[test]
     fn assert_simple_functioning() {
-        let mut mem_pool = MemPool::new(1, 1,
+        let mem_pool = MemPool::new(1, 1,
                                     || { Vec::<u8>::with_capacity(4096) });
 
         let option = mem_pool.try_pull();
