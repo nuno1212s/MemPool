@@ -1,15 +1,19 @@
+use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct MemPool<T> {
+    inner: Arc<InnerPool<T>>,
+    counter: RefCell<usize>,
+}
+
+pub struct InnerPool<T> {
     buckets: Vec<Mutex<Vec<T>>>,
-    pull_ctr: AtomicUsize,
-    insert_ctr: AtomicUsize,
     capacity: usize,
 }
 
-impl<T> MemPool<T> {
+impl<T> InnerPool<T> {
     pub fn new<F>(bucket_count: usize, capacity_per_bucket: usize,
                   init_fn: F) -> Arc<Self> where F: Fn() -> T {
         let mut buckets = Vec::with_capacity(bucket_count);
@@ -27,147 +31,128 @@ impl<T> MemPool<T> {
         Arc::new(
             Self {
                 buckets,
-                pull_ctr: AtomicUsize::new(0),
-                insert_ctr: AtomicUsize::new(0),
                 capacity: capacity_per_bucket,
             }
         )
     }
 
-    fn try_pull_from_bucket(self: &Arc<Self>, bucket: usize) -> Option<ModifiableMemShare<T>> {
+    fn try_pull_from_bucket<'a>(self: &'a Arc<Self>, counter: usize) -> Option<MutMemShare<'a, T>> {
+        let bucket = counter % self.buckets.len();
+
         let mem = {
             let mut bucket_guard = self.buckets[bucket].lock().unwrap();
 
             bucket_guard.pop()
         };
 
-        mem.map(|mem| ModifiableMemShare {
-            pool: Arc::clone(self),
+        mem.map(|mem| MutMemShare {
+            pool: self,
             mem: Some(mem),
+            bucket,
         })
     }
 
-    #[inline]
-    pub fn try_pull(self: &Arc<Self>) -> Option<ModifiableMemShare<T>> {
-        let round_robin = self.pull_ctr.fetch_add(1, Ordering::Relaxed);
+    fn try_pull_from_bucket_with_fallback<'a, F>(self: &'a Arc<Self>, counter: usize, fallback: F) -> MutMemShare<'a, T>
+        where F: Fn() -> T {
+        let bucket = counter % self.buckets.len();
 
-        let bucket = round_robin % self.buckets.len();
+        let mem = {
+            let mut bucket_guard = self.buckets[bucket].lock().unwrap();
 
-        self.try_pull_from_bucket(bucket)
-    }
+            bucket_guard.pop()
+        };
 
-    /// Try to pull a memory object from all of the buckets
-    #[inline]
-    pub fn try_pull_from_all_buckets(self: &Arc<Self>) -> Option<ModifiableMemShare<T>> {
-        let round_robin = self.pull_ctr.fetch_add(1, Ordering::Relaxed);
-        let bucket_len = self.buckets.len();
-
-        let bucket = round_robin % bucket_len;
-
-        let mut bucket_inc = 0;
-
-        loop {
-            if bucket_inc >= bucket_len {
-                break;
-            }
-
-            let final_bucket = (bucket + bucket_inc) % bucket_len;
-
-            if let Some(mem) = self.try_pull_from_bucket(final_bucket) {
-                return Some(mem);
-            } else {
-                bucket_inc += 1;
-            }
-        }
-
-        None
-    }
-
-    /// Try to pull from all of the buckets and if this still fails, then use the provided fallback
-    /// function
-    #[inline]
-    pub fn pull_with_fallback<F>(self: &Arc<Self>, fallback: F) -> ModifiableMemShare<T> where F: Fn() -> T {
-        match self.try_pull_from_all_buckets() {
+        match mem {
             None => {
-                ModifiableMemShare {
-                    pool: Arc::clone(self),
+                MutMemShare {
+                    pool: self,
                     mem: Some(fallback()),
+                    bucket,
                 }
             }
             Some(mem) => {
-                mem
+                MutMemShare {
+                    pool: self,
+                    mem: Some(mem),
+                    bucket,
+                }
             }
         }
     }
 
-    /// Re attach a given memory into the pool
-    #[inline]
-    fn re_attach(&self, mem: T) {
-        let round_robin = self.insert_ctr.fetch_add(1, Ordering::Relaxed);
-        let bucket_len = self.buckets.len();
+    fn re_attach(&self, bucket: usize, mem: T) {
+        let final_bucket = bucket % self.buckets.len();
 
-        let bucket = round_robin % bucket_len;
+        let mut bucket_guard = self.buckets[final_bucket].lock().unwrap();
 
-        // We will speculatively try to insert it into the other buckets as it is important for us to not
-        // Waste memory while also not using too many cross thread operations on the insert ctr
-        let mut bucket_inc = 0;
-
-        loop {
-            if bucket_inc > bucket_len {
-                // We have tried too many times, ignore this memory and let it be discarded
-                break;
-            }
-
-            let final_bucket = (bucket + bucket_inc) % bucket_len;
-
-            let mut bucket_guard = self.buckets[final_bucket].lock().unwrap();
-
-            if bucket_guard.len() >= self.capacity {
-                bucket_inc += 1
-            } else {
-                bucket_guard.push(mem);
-
-                break;
-            }
+        if bucket_guard.len() < self.capacity {
+            bucket_guard.push(mem);
         }
-
-        // If we can't place it anywhere, then forget it :(
     }
 }
 
-/// Delimit some common methods of pooled memory
+impl<T> MemPool<T> {
+    pub fn new<F>(bucket_count: usize, capacity_per_bucket: usize,
+                  init_fn: F) -> Self where F: Fn() -> T {
+        let inner_pool = InnerPool::new(bucket_count, capacity_per_bucket, init_fn);
+
+        Self {
+            inner: inner_pool,
+            counter: RefCell::new(0),
+        }
+    }
+
+    pub fn try_pull(& self) -> Option<MutMemShare<'_, T>> {
+        let result = self.inner.try_pull_from_bucket(*self.counter.borrow());
+
+        let mut ref_mut = self.counter.borrow_mut();
+
+        *ref_mut = ref_mut.wrapping_add(1);
+
+        result
+    }
+
+    pub fn try_pull_with_fallback<F>(&mut self, fallback: F) -> MutMemShare<'_, T> where F: Fn() -> T {
+        let result = self.inner.try_pull_from_bucket_with_fallback(*self.counter.borrow(), fallback);
+
+        let mut ref_mut = self.counter.borrow_mut();
+
+        *ref_mut = ref_mut.wrapping_add(1);
+
+        result
+    }
+}
+
+impl<T> Clone for MemPool<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            counter: RefCell::new(rand::random()),
+        }
+    }
+}
+
 pub trait PooledMem<T> {
     fn detach(self) -> T;
 }
 
-pub struct ModifiableMemShare<T> {
-    pool: Arc<MemPool<T>>,
+pub struct MutMemShare<'a, T> {
+    pool: &'a Arc<InnerPool<T>>,
     mem: Option<T>,
+    bucket: usize,
 }
 
-impl<T> ModifiableMemShare<T> {
-    pub fn freeze(mut self) -> Arc<ShareableMemShare<T>> {
-        Arc::new(ShareableMemShare {
-            //TODO: Can we reduce the amount of Arc clones?
-            pool: self.pool.clone(),
-            mem: self.mem.take(),
-        })
-    }
-}
-
-impl<T> PooledMem<T> for ModifiableMemShare<T> {
-    fn detach(mut self) -> (T, Arc<MemPool<T>>) {
-        let option = self.mem.take();
-
-        if let Some(mem) = option {
-            (mem, self.pool.clone())
+impl<'a, T> PooledMem<T> for MutMemShare<'a, T> {
+    fn detach(mut self) -> T {
+        if let Some(mem) = self.mem.take() {
+            mem
         } else {
             unreachable!()
         }
     }
 }
 
-impl<T> Deref for ModifiableMemShare<T> {
+impl<'a, T> Deref for MutMemShare<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -178,7 +163,7 @@ impl<T> Deref for ModifiableMemShare<T> {
     }
 }
 
-impl<T> DerefMut for ModifiableMemShare<T> {
+impl<'a, T> DerefMut for MutMemShare<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.mem {
             None => { unreachable!() }
@@ -187,67 +172,33 @@ impl<T> DerefMut for ModifiableMemShare<T> {
     }
 }
 
-impl<T> Drop for ModifiableMemShare<T> {
-    fn drop(&mut self) {
-        let mem = self.mem.take();
+impl<'a, T> MutMemShare<'a, T> {
+    pub fn freeze(mut self) -> ShareableMem<T> {
+        let pool_clone = Arc::clone(self.pool);
 
-        if let Some(mem) = mem {
-            self.pool.re_attach(mem)
-        } else {
-            //The memory has already been taken
-            // This will only happen when we are moving from
-            // Modifiable mem shares to shareable mem shares
-        }
-    }
-}
-
-pub struct ShareableMemShare<T> {
-    pool: Arc<MemPool<T>>,
-    mem: Option<T>,
-}
-
-impl<T> ShareableMemShare<T> {
-    pub fn unfreeze(mut self) -> ModifiableMemShare<T> {
-        ModifiableMemShare {
-            pool: self.pool.clone(),
+        ShareableMem {
+            inner: pool_clone,
             mem: self.mem.take(),
         }
     }
 }
 
-impl<T> PooledMem<T> for ShareableMemShare<T> {
-    fn detach(mut self) -> (T, Arc<MemPool<T>>) {
-        let option = self.mem.take();
-
-        if let Some(mem) = option {
-            (mem, self.pool.clone())
-        } else {
-            unreachable!()
-        }
-    }
-}
-
-impl<T> Deref for ShareableMemShare<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match &self.mem {
-            None => { unreachable!() }
-            Some(mem) => { mem }
-        }
-    }
-}
-
-impl<T> Drop for ShareableMemShare<T> {
+impl<'a, T> Drop for MutMemShare<'a, T> {
     fn drop(&mut self) {
-        let memory = self.mem.take();
-
-        if let Some(mem) = memory {
-            self.pool.re_attach(mem)
-        } else {
-            //The memory has already been taken
+        match self.mem.take() {
+            Some(mem) => {
+                self.pool.re_attach(self.bucket, mem);
+            }
+            None => {
+                // Might be a result of a freeze operation
+            }
         }
     }
+}
+
+pub struct ShareableMem<T> {
+    inner: Arc<InnerPool<T>>,
+    mem: Option<T>,
 }
 
 
@@ -257,7 +208,7 @@ mod tests {
 
     #[test]
     fn assert_simple_functioning() {
-        let mem_pool = MemPool::new(1, 1,
+        let mut mem_pool = MemPool::new(1, 1,
                                     || { Vec::<u8>::with_capacity(4096) });
 
         let option = mem_pool.try_pull();
