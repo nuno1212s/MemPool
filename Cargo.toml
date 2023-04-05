@@ -2,7 +2,12 @@
 name = "mem_pool"
 version = "0.1.0"
 edition = "2021"
+description = "A Multi Threading friendly Memory / Object pooling library"
+homepage = "https://github.com/nuno1212s/MemPool"
+repository = "https://github.com/nuno1212s/MemPool"
 authors = ["Nuno Neto"]
+license-file = "LICENSE"
+readme="README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
