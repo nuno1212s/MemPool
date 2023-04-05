@@ -144,7 +144,7 @@ fn perform_alloc_test(c: &mut Criterion, name: String, test: TestType) {
 }
 
 fn basics(c: &mut Criterion) {
-    perform_alloc_test(c, format!("alloc_from_pool"), TestType::MemPool(8, 1000));
+    perform_alloc_test(c, format!("alloc_from_pool"), TestType::MemPool(32, 1000));
 
     perform_alloc_test(c, format!("alloc_from_obj_pool"), TestType::ObjPool(1000));
 

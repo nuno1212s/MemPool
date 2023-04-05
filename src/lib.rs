@@ -176,6 +176,7 @@ impl<'a, T> MutMemShare<'a, T> {
         ShareableMem {
             inner: pool_clone,
             mem: self.mem.take(),
+            bucket: self.bucket,
         }
     }
 }
@@ -196,8 +197,40 @@ impl<'a, T> Drop for MutMemShare<'a, T> {
 pub struct ShareableMem<T> {
     inner: Arc<InnerPool<T>>,
     mem: Option<T>,
+    bucket: usize,
 }
 
+impl<T> PooledMem<T> for ShareableMem<T> {
+    fn detach(mut self) -> T {
+        if let Some(mem) = self.mem.take() {
+            mem
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+impl<T> Deref for ShareableMem<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.mem {
+            Some(mem) => { mem }
+            None => { unreachable!() }
+        }
+    }
+}
+
+impl<T> Drop for ShareableMem<T> {
+    fn drop(&mut self) {
+        match self.mem.take() {
+            Some(mem) => {
+                self.inner.re_attach(self.bucket, mem);
+            }
+            None => {}
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -221,56 +254,5 @@ mod tests {
         }
 
         assert!(mem_pool.try_pull().is_some());
-    }
-
-    #[test]
-    fn detach_then_attach() {
-        /*
-        let pool = Pool::new(1, || Vec::new());
-        let (pool, mut object) = pool.try_pull().unwrap().detach();
-        object.push(1);
-        pool.attach(object);
-        assert_eq!(pool.try_pull().unwrap()[0], 1);
-         */
-    }
-
-    #[test]
-    fn pull() {
-        /*
-        let pool = Pool::<Vec<u8>>::new(1, || Vec::new());
-
-        let object1 = pool.try_pull();
-        let object2 = pool.try_pull();
-        let object3 = pool.pull(|| Vec::new());
-
-        assert!(object1.is_some());
-        assert!(object2.is_none());
-        drop(object1);
-        drop(object2);
-        drop(object3);
-        assert_eq!(pool.len(), 2);
-        */
-    }
-
-    #[test]
-    fn e2e() {
-        /*
-        let pool = Pool::new(10, || Vec::new());
-        let mut objects = Vec::new();
-
-        for i in 0..10 {
-            let mut object = pool.try_pull().unwrap();
-            object.push(i);
-            objects.push(object);
-        }
-
-        assert!(pool.try_pull().is_none());
-        drop(objects);
-        assert!(pool.try_pull().is_some());
-
-        for i in (10..0).rev() {
-            let mut object = pool.objects.lock().pop().unwrap();
-            assert_eq!(object.pop(), Some(i));
-        }*/
     }
 }
